@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use polymarket_client_sdk::gamma::{self, types::request::TeamsRequest};
 
-use super::ascending_flag;
 use crate::output::sports::{print_sport_types, print_sports_table, print_teams_table};
 use crate::output::{OutputFormat, print_json};
 
@@ -75,7 +74,7 @@ pub async fn execute(client: &gamma::Client, args: SportsArgs, output: OutputFor
                 .limit(limit)
                 .maybe_offset(offset)
                 .maybe_order(order)
-                .maybe_ascending(ascending_flag(ascending))
+                .ascending(ascending)
                 .league(league.into_iter().collect())
                 .build();
 

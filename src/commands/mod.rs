@@ -30,10 +30,6 @@ macro_rules! enum_from {
 
 pub(crate) use enum_from;
 
-pub fn ascending_flag(ascending: bool) -> Option<bool> {
-    ascending.then_some(true)
-}
-
 pub fn is_numeric_id(id: &str) -> bool {
     id.parse::<u64>().is_ok()
 }

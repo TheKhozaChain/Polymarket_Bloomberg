@@ -5,7 +5,6 @@ use polymarket_client_sdk::gamma::{
     types::request::{SeriesByIdRequest, SeriesListRequest},
 };
 
-use super::ascending_flag;
 use crate::output::series::{print_series_detail, print_series_table};
 use crate::output::{OutputFormat, print_json};
 
@@ -60,7 +59,7 @@ pub async fn execute(client: &gamma::Client, args: SeriesArgs, output: OutputFor
                 .limit(limit)
                 .maybe_offset(offset)
                 .maybe_order(order)
-                .maybe_ascending(ascending_flag(ascending))
+                .ascending(ascending)
                 .maybe_closed(closed)
                 .build();
 
