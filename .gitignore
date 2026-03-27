@@ -19,3 +19,11 @@ rs-clob-client/
 .env
 
 CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
