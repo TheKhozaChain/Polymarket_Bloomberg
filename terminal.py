@@ -518,9 +518,9 @@ def build_events(events: list[dict]) -> Group:
     t.add_column(" ", width=1)
     t.add_column("VOL", justify="right", width=7)
 
-    for ev in events[:8]:
+    for ev in events[:20]:
         vol = sum(float(m.get("volume", 0) or 0) for m in (ev.get("markets", []) or []))
-        t.add_row(trunc(ev.get("title", ""), 28), "", Text(fmt_vol(vol), style="cyan"))
+        t.add_row(trunc(ev.get("title", ""), 50), "", Text(fmt_vol(vol), style="cyan"))
     return Group(hdr, t)
 
 
