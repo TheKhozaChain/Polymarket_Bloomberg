@@ -241,6 +241,7 @@ def parse_markets(events: list[dict]) -> list[dict]:
             rows.append(dict(title=title, yes=yp, no=np_, vol=total_vol, token_id=tid))
         else:
             rows.append(dict(title=title, yes=0.0, no=0.0, vol=total_vol, token_id=""))
+    rows.sort(key=lambda x: x["vol"], reverse=True)
     return rows
 
 
@@ -291,7 +292,7 @@ def build_markets_table(markets: list[dict]) -> Group:
     for m in markets[:22]:
         y, n = m["yes"], m["no"]
         t.add_row(
-            trunc(m["title"], 26),
+            trunc(m["title"], 36),
             Text(fmt_cents(y), style="bold green" if y > 0.5 else "green"),
             Text(fmt_cents(n), style="bold red" if n > 0.5 else "red"),
             Text(bar_block(y, 8), style="green"),
@@ -518,9 +519,13 @@ def build_events(events: list[dict]) -> Group:
     t.add_column(" ", width=1)
     t.add_column("VOL", justify="right", width=7)
 
-    for ev in events[:20]:
+    ev_rows = []
+    for ev in events:
         vol = sum(float(m.get("volume", 0) or 0) for m in (ev.get("markets", []) or []))
-        t.add_row(trunc(ev.get("title", ""), 50), "", Text(fmt_vol(vol), style="cyan"))
+        ev_rows.append((ev.get("title", ""), vol))
+    ev_rows.sort(key=lambda x: x[1], reverse=True)
+    for title, vol in ev_rows[:20]:
+        t.add_row(trunc(title, 50), "", Text(fmt_vol(vol), style="cyan"))
     return Group(hdr, t)
 
 
