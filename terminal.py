@@ -663,6 +663,8 @@ class PolymarketTerminal(App):
         self.leaders_data: list[dict] = []
         self.crypto_data: dict = {}
         self.books_data: list[tuple[str, dict, float]] = []
+        self.book_pool: list[dict] = []       # validated candidates with two-sided books
+        self.book_rotation: int = 0           # rotation offset into pool
         self.trade_feed: deque = deque(maxlen=40)
         self.msg_count = 0
         self.lb_period = "day"
@@ -718,16 +720,41 @@ class PolymarketTerminal(App):
         self.markets_data = parse_markets(events)
         self.msg_count += len(self.markets_data) + 4
 
+        # ── Orderbook rotation ──
+        # Rebuild the validated pool every 5 cycles (~60s) or if empty
         candidates = find_orderbook_candidates(raw_markets)
+        if not self.book_pool or self.book_rotation % 5 == 0:
+            pool: list[dict] = []
+            for cand in candidates[:15]:
+                book = await self.api.order_book(cand["token_id"])
+                bids, asks = normalize_book(book)
+                if len(bids) >= 3 and len(asks) >= 3:
+                    pool.append(cand)
+                if len(pool) >= 8:
+                    break
+            self.book_pool = pool
+
+        # Pin slot 0 = highest volume candidate, rotate slots 1-2 through rest
+        pool = self.book_pool
         books: list[tuple[str, dict, float]] = []
-        for cand in candidates[:8]:
-            if len(books) >= 3:
-                break
-            book = await self.api.order_book(cand["token_id"])
-            bids, asks = normalize_book(book)
-            if len(bids) >= 3 and len(asks) >= 3:
-                books.append((cand["question"], book, cand["yes"]))
+        if pool:
+            # Always show #1
+            top = pool[0]
+            book = await self.api.order_book(top["token_id"])
+            books.append((top["question"], book, top["yes"]))
+
+            # Rotate through remaining pool for slots 2 and 3
+            rest = pool[1:]
+            if rest:
+                n = len(rest)
+                for offset in range(2):
+                    idx = (self.book_rotation + offset) % n
+                    cand = rest[idx]
+                    book = await self.api.order_book(cand["token_id"])
+                    books.append((cand["question"], book, cand["yes"]))
+
         self.books_data = books
+        self.book_rotation += 1
 
         self._render_all()
         self._tick_ticker()
