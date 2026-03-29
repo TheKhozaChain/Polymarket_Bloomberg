@@ -138,6 +138,17 @@ class PolyAPI:
         except Exception:
             return []
 
+    async def live_trades(self, limit: int = 15) -> list[dict]:
+        """Fetch recent trades across all markets from the data API."""
+        try:
+            r = await self.http.get(
+                f"{DATA_API}/trades", params=dict(limit=limit),
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return []
+
     _crypto_cache: dict = {}
 
     async def crypto_prices(self) -> dict:
@@ -574,16 +585,8 @@ def build_events(events: list[dict]) -> Group:
     return Group(hdr, t)
 
 
-def build_feed(markets: list[dict], feed: deque) -> Text:
-    if markets:
-        m = random.choice(markets[:10])
-        side = random.choice(["BUY", "SELL"])
-        price = m["yes"] if side == "BUY" else m["no"]
-        if 0.01 < price < 0.99:
-            size = random.randint(10, 5000)
-            ts = datetime.now().strftime("%H:%M:%S")
-            feed.appendleft((ts, side, price, size, trunc(m["title"], 24)))
-
+def build_feed(feed: deque) -> Text:
+    """Render the trade feed from real trade data."""
     txt = Text()
     for ts, side, price, size, title in list(feed)[:22]:
         sty = "green" if side == "BUY" else "red"
@@ -592,11 +595,37 @@ def build_feed(markets: list[dict], feed: deque) -> Text:
         txt.append(f"{arrow} {side} ", style=f"bold {sty}")
         txt.append(f"{fmt_cents(price)}", style=sty)
         txt.append("\u00d7", style="dim")
-        txt.append(f"{size}", style=sty)
+        txt.append(f"{size:.0f}", style=sty)
         txt.append(" | ", style="dim")
         txt.append(title, style="white")
         txt.append("\n")
     return txt
+
+
+def parse_live_trades(raw_trades: list[dict], seen: set) -> list[tuple]:
+    """Parse raw API trades into feed tuples, deduplicating."""
+    new_trades = []
+    for t in raw_trades:
+        # Create a unique key from wallet+timestamp+asset to deduplicate
+        key = f"{t.get('proxyWallet','')[:10]}_{t.get('timestamp','')}_{t.get('asset','')[:10]}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        side = t.get("side", "BUY")
+        price = float(t.get("price", 0))
+        size = float(t.get("size", 0))
+        title = t.get("title", "")
+        ts_epoch = t.get("timestamp", 0)
+
+        if ts_epoch:
+            ts_str = datetime.fromtimestamp(ts_epoch).strftime("%H:%M:%S")
+        else:
+            ts_str = datetime.now().strftime("%H:%M:%S")
+
+        new_trades.append((ts_str, side, price, size, trunc(title, 24)))
+
+    return new_trades
 
 
 # ── Textual CSS ────────────────────────────────────────────────────────────
@@ -712,6 +741,7 @@ class PolymarketTerminal(App):
         self.book_pool: list[dict] = []       # validated candidates with two-sided books
         self.book_rotation: int = 0           # rotation offset into pool
         self.trade_feed: deque = deque(maxlen=40)
+        self.trade_seen: set = set()
         self.msg_count = 0
         self.lb_period = "day"
         self.ticker_offset = 0
@@ -745,7 +775,7 @@ class PolymarketTerminal(App):
     def on_mount(self) -> None:
         self.refresh_all_data()
         self.set_interval(12.0, self.refresh_all_data)
-        self.set_interval(1.5, self._tick_feed)
+        self.set_interval(5.0, self._tick_feed)
         self.set_interval(1.8, self._tick_ticker)
         self.set_interval(1.0, self._tick_status)
 
@@ -825,11 +855,17 @@ class PolymarketTerminal(App):
 
     # ── Tickers ──
 
-    def _tick_feed(self) -> None:
-        if not self.markets_data:
-            return
-        self.msg_count += 1
-        self._safe_update("#feed-panel", build_feed(self.markets_data, self.trade_feed))
+    @work(exclusive=True, group="feed-refresh")
+    async def _tick_feed(self) -> None:
+        raw_trades = await self.api.live_trades(20)
+        new_trades = parse_live_trades(raw_trades, self.trade_seen)
+        for trade in reversed(new_trades):
+            self.trade_feed.appendleft(trade)
+        self.msg_count += len(new_trades)
+        # Keep seen set from growing unbounded
+        if len(self.trade_seen) > 500:
+            self.trade_seen = set(list(self.trade_seen)[-200:])
+        self._safe_update("#feed-panel", build_feed(self.trade_feed))
 
     def _tick_ticker(self) -> None:
         if not self.markets_data:
