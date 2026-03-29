@@ -723,7 +723,7 @@ class PolymarketTerminal(App):
         # ── Orderbook rotation ──
         # Rebuild the validated pool every 5 cycles (~60s) or if empty
         candidates = find_orderbook_candidates(raw_markets)
-        if not self.book_pool or self.book_rotation % 5 == 0:
+        if not self.book_pool or self.book_rotation % 12 == 0:
             pool: list[dict] = []
             for cand in candidates[:15]:
                 book = await self.api.order_book(cand["token_id"])
@@ -754,7 +754,10 @@ class PolymarketTerminal(App):
                     books.append((cand["question"], book, cand["yes"]))
 
         self.books_data = books
-        self.book_rotation += 1
+        # Advance rotation every ~30s (every 2-3 refresh cycles at 12s interval)
+        self._book_refresh_count = getattr(self, "_book_refresh_count", 0) + 1
+        if self._book_refresh_count % 3 == 0:
+            self.book_rotation += 1
 
         self._render_all()
         self._tick_ticker()
