@@ -184,6 +184,53 @@ class PolyAPI:
             }
         return result
 
+    # Yahoo Finance tickers: stocks + futures
+    STOCK_SYMBOLS = ["NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "COIN", "GC=F", "CL=F"]
+    # Display names (GC=F -> GOLD, CL=F -> OIL)
+    STOCK_DISPLAY = {"GC=F": "GOLD", "CL=F": "OIL"}
+    _stock_cache: dict = {}
+
+    async def stock_prices(self) -> dict:
+        """Fetch live stock/commodity prices from Yahoo Finance."""
+        results = {}
+        try:
+            tasks = [self._fetch_yahoo_quote(sym) for sym in self.STOCK_SYMBOLS]
+            quotes = await asyncio.gather(*tasks)
+            for sym, quote in zip(self.STOCK_SYMBOLS, quotes):
+                if quote:
+                    display = self.STOCK_DISPLAY.get(sym, sym)
+                    results[display] = quote
+            if results:
+                self._stock_cache = results
+                return results
+        except Exception:
+            pass
+        if self._stock_cache:
+            return self._stock_cache
+        return {}
+
+    async def _fetch_yahoo_quote(self, symbol: str):
+        """Fetch a single quote from Yahoo Finance chart API."""
+        try:
+            r = await self.http.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                params=dict(interval="1d", range="1d"),
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
+            price = meta.get("regularMarketPrice", 0)
+            prev_close = meta.get("chartPreviousClose", 0) or meta.get("previousClose", 0)
+            if price and prev_close:
+                chg_pct = ((price - prev_close) / prev_close) * 100
+            else:
+                chg_pct = 0
+            return {"price": float(price), "change": float(chg_pct)}
+        except Exception:
+            return None
+
 
 # ── Parse events into market rows ──────────────────────────────────────────
 
@@ -423,21 +470,15 @@ def build_orderbooks(book_data: list[tuple[str, dict, float]]) -> Group:
     return Group(*parts)
 
 
-def build_assets(crypto: dict) -> Group:
+def build_assets(crypto: dict, stocks: dict) -> Group:
     now = datetime.now().strftime("%H:%M:%S")
     hdr = Text()
     hdr.append(" \u25c6 ", style="bold cyan")
     hdr.append("LIVE ASSETS", style="bold cyan")
     hdr.append(f"  {now}", style="dim white")
 
-    TICKERS = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "xrp": "XRP"}
-    STOCKS = [
-        ("NVDA", 110.15, 0.43), ("AAPL", 256.66, 0.20),
-        ("MSFT", 371.28, 0.11), ("AMZN", 212.37, 0.11),
-        ("META", 563.41, 0.04), ("GOOGL", 286.59, 0.03),
-        ("TSLA", 380.69, 0.23), ("COIN", 177.32, 0.27),
-        ("GOLD", 4465.41, 0.01), ("OIL", 69.92, -0.35),
-    ]
+    CRYPTO_TICKERS = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "xrp": "XRP"}
+    STOCK_ORDER = ["NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "COIN", "GOLD", "OIL"]
 
     t = Table(
         box=None, expand=True, show_header=False, show_edge=False,
@@ -451,27 +492,30 @@ def build_assets(crypto: dict) -> Group:
     t.add_column("P2", justify="right", width=8)
     t.add_column("C2", justify="right", width=6)
 
-    def _fmt_asset_price(p: float) -> str:
+    def _fmt_price(p: float) -> str:
         if p >= 1000:
             return f"${p:,.0f}"
         return f"${p:,.2f}"
 
     crypto_rows = []
-    for cid, tick in TICKERS.items():
+    for cid, tick in CRYPTO_TICKERS.items():
         d = crypto.get(cid, {})
         price = d.get("usd", 0)
         chg = d.get("usd_24h_change", 0) or 0
         sty = "green" if chg >= 0 else "red"
-        crypto_rows.append((tick, _fmt_asset_price(price), Text(fmt_pct(chg), style=sty)))
+        crypto_rows.append((tick, _fmt_price(price), Text(fmt_pct(chg), style=sty)))
 
-    for i in range(max(len(crypto_rows), len(STOCKS))):
+    stock_rows = []
+    for tick in STOCK_ORDER:
+        d = stocks.get(tick, {})
+        price = d.get("price", 0)
+        chg = d.get("change", 0)
+        sty = "green" if chg >= 0 else "red"
+        stock_rows.append((tick, _fmt_price(price), Text(fmt_pct(chg), style=sty)))
+
+    for i in range(max(len(crypto_rows), len(stock_rows))):
         cr = crypto_rows[i] if i < len(crypto_rows) else ("", "", Text(""))
-        if i < len(STOCKS):
-            st, sp, sc = STOCKS[i]
-            sty = "green" if sc >= 0 else "red"
-            sr = (st, _fmt_asset_price(sp), Text(fmt_pct(sc), style=sty))
-        else:
-            sr = ("", "", Text(""))
+        sr = stock_rows[i] if i < len(stock_rows) else ("", "", Text(""))
         t.add_row(cr[0], cr[1], cr[2], "", sr[0], sr[1], sr[2])
 
     return Group(hdr, t)
@@ -663,6 +707,7 @@ class PolymarketTerminal(App):
         self.events_data: list[dict] = []
         self.leaders_data: list[dict] = []
         self.crypto_data: dict = {}
+        self.stock_data: dict = {}
         self.books_data: list[tuple[str, dict, float]] = []
         self.book_pool: list[dict] = []       # validated candidates with two-sided books
         self.book_rotation: int = 0           # rotation offset into pool
@@ -708,16 +753,18 @@ class PolymarketTerminal(App):
 
     @work(exclusive=True, group="main-refresh")
     async def refresh_all_data(self) -> None:
-        events, raw_markets, leaders, crypto = await asyncio.gather(
+        events, raw_markets, leaders, crypto, stocks = await asyncio.gather(
             self.api.events(25),
             self.api.markets(80),
             self.api.leaderboard(self.lb_period, 10),
             self.api.crypto_prices(),
+            self.api.stock_prices(),
         )
 
         self.events_data = events
         self.leaders_data = leaders
         self.crypto_data = crypto
+        self.stock_data = stocks
         self.markets_data = parse_markets(events)
         self.msg_count += len(self.markets_data) + 4
 
@@ -766,7 +813,7 @@ class PolymarketTerminal(App):
     def _render_all(self) -> None:
         self._safe_update("#markets-panel", build_markets_table(self.markets_data))
         self._safe_update("#books-inner", build_orderbooks(self.books_data))
-        self._safe_update("#assets-panel", build_assets(self.crypto_data))
+        self._safe_update("#assets-panel", build_assets(self.crypto_data, self.stock_data))
         self._safe_update("#traders-panel", build_traders(self.leaders_data, self.lb_period))
         self._safe_update("#events-inner", build_events(self.events_data))
 
