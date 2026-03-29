@@ -741,6 +741,7 @@ class PolymarketTerminal(App):
         self.book_pool: list[dict] = []       # validated candidates with two-sided books
         self.book_rotation: int = 0           # rotation offset into pool
         self.trade_feed: deque = deque(maxlen=40)
+        self.trade_queue: deque = deque()     # incoming trades waiting to be displayed
         self.trade_seen: set = set()
         self.msg_count = 0
         self.lb_period = "day"
@@ -775,7 +776,8 @@ class PolymarketTerminal(App):
     def on_mount(self) -> None:
         self.refresh_all_data()
         self.set_interval(12.0, self.refresh_all_data)
-        self.set_interval(5.0, self._tick_feed)
+        self.set_interval(3.0, self._poll_trades)
+        self.set_interval(0.7, self._drip_trade)
         self.set_interval(1.8, self._tick_ticker)
         self.set_interval(1.0, self._tick_status)
 
@@ -855,17 +857,25 @@ class PolymarketTerminal(App):
 
     # ── Tickers ──
 
-    @work(exclusive=True, group="feed-refresh")
-    async def _tick_feed(self) -> None:
+    @work(exclusive=True, group="feed-poll")
+    async def _poll_trades(self) -> None:
+        """Poll API for new trades and queue them for drip display."""
         raw_trades = await self.api.live_trades(20)
         new_trades = parse_live_trades(raw_trades, self.trade_seen)
+        # Add to queue in chronological order (oldest first, so they drip newest-last)
         for trade in reversed(new_trades):
-            self.trade_feed.appendleft(trade)
-        self.msg_count += len(new_trades)
+            self.trade_queue.append(trade)
         # Keep seen set from growing unbounded
         if len(self.trade_seen) > 500:
             self.trade_seen = set(list(self.trade_seen)[-200:])
-        self._safe_update("#feed-panel", build_feed(self.trade_feed))
+
+    def _drip_trade(self) -> None:
+        """Pop one trade from the queue into the visible feed every tick."""
+        if self.trade_queue:
+            trade = self.trade_queue.popleft()
+            self.trade_feed.appendleft(trade)
+            self.msg_count += 1
+            self._safe_update("#feed-panel", build_feed(self.trade_feed))
 
     def _tick_ticker(self) -> None:
         if not self.markets_data:
