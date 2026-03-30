@@ -8,8 +8,8 @@ Keys:   r=refresh  1/2/3=leaderboard(day/week/all)  q=quit
 
 import asyncio
 import json
-import random
-from collections import deque
+import logging
+from collections import deque, OrderedDict
 from datetime import datetime
 from typing import Any
 
@@ -23,6 +23,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.widgets import Footer, Static
+
+log = logging.getLogger("polyterm")
 
 # ── API endpoints ──────────────────────────────────────────────────────────
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -72,7 +74,6 @@ def bar_block(pct: float, width: int = 8) -> str:
 
 
 def fmt_size(n: float) -> str:
-    """Format size compactly to avoid column overflow."""
     if n >= 1_000_000:
         return f"{n / 1e6:.1f}M"
     if n >= 10_000:
@@ -84,10 +85,24 @@ def fmt_size(n: float) -> str:
 
 # ── API Client ─────────────────────────────────────────────────────────────
 
+# Shorter timeout for individual requests to prevent refresh stalls
+_FAST_TIMEOUT = httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0)
+
 
 class PolyAPI:
     def __init__(self):
-        self.http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        self.http = httpx.AsyncClient(timeout=_FAST_TIMEOUT, follow_redirects=True)
+        self.errors: list[str] = []  # recent errors for status display
+
+    def _record_error(self, source: str, exc: Exception) -> None:
+        msg = f"{source}: {type(exc).__name__}"
+        self.errors.append(msg)
+        if len(self.errors) > 10:
+            self.errors.pop(0)
+        log.warning(msg)
+
+    async def close(self) -> None:
+        await self.http.aclose()
 
     async def events(self, limit: int = 25) -> list[dict]:
         try:
@@ -100,7 +115,8 @@ class PolyAPI:
             )
             r.raise_for_status()
             return r.json()
-        except Exception:
+        except Exception as e:
+            self._record_error("events", e)
             return []
 
     async def markets(self, limit: int = 50) -> list[dict]:
@@ -114,7 +130,8 @@ class PolyAPI:
             )
             r.raise_for_status()
             return r.json()
-        except Exception:
+        except Exception as e:
+            self._record_error("markets", e)
             return []
 
     async def order_book(self, token_id: str) -> dict:
@@ -124,7 +141,8 @@ class PolyAPI:
             )
             r.raise_for_status()
             return r.json()
-        except Exception:
+        except Exception as e:
+            self._record_error("book", e)
             return {"bids": [], "asks": []}
 
     async def leaderboard(self, period: str = "day", limit: int = 10) -> list[dict]:
@@ -135,18 +153,19 @@ class PolyAPI:
             )
             r.raise_for_status()
             return r.json()
-        except Exception:
+        except Exception as e:
+            self._record_error("leaderboard", e)
             return []
 
     async def live_trades(self, limit: int = 15) -> list[dict]:
-        """Fetch recent trades across all markets from the data API."""
         try:
             r = await self.http.get(
                 f"{DATA_API}/trades", params=dict(limit=limit),
             )
             r.raise_for_status()
             return r.json()
-        except Exception:
+        except Exception as e:
+            self._record_error("trades", e)
             return []
 
     _crypto_cache: dict = {}
@@ -195,33 +214,29 @@ class PolyAPI:
             }
         return result
 
-    # Yahoo Finance tickers: stocks + futures
     STOCK_SYMBOLS = ["NVDA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "COIN", "GC=F", "CL=F"]
-    # Display names (GC=F -> GOLD, CL=F -> OIL)
     STOCK_DISPLAY = {"GC=F": "GOLD", "CL=F": "OIL"}
     _stock_cache: dict = {}
 
     async def stock_prices(self) -> dict:
-        """Fetch live stock/commodity prices from Yahoo Finance."""
         results = {}
         try:
             tasks = [self._fetch_yahoo_quote(sym) for sym in self.STOCK_SYMBOLS]
-            quotes = await asyncio.gather(*tasks)
+            quotes = await asyncio.gather(*tasks, return_exceptions=True)
             for sym, quote in zip(self.STOCK_SYMBOLS, quotes):
-                if quote:
+                if isinstance(quote, dict) and quote:
                     display = self.STOCK_DISPLAY.get(sym, sym)
                     results[display] = quote
             if results:
                 self._stock_cache = results
                 return results
-        except Exception:
-            pass
+        except Exception as e:
+            self._record_error("stocks", e)
         if self._stock_cache:
             return self._stock_cache
         return {}
 
     async def _fetch_yahoo_quote(self, symbol: str):
-        """Fetch a single quote from Yahoo Finance chart API."""
         try:
             r = await self.http.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
@@ -359,13 +374,13 @@ def build_markets_table(markets: list[dict]) -> Group:
     return Group(hdr, t)
 
 
-def normalize_book(book: dict) -> tuple[list[dict], list[dict]]:
+def normalize_book(book: dict) -> tuple:
     bids = sorted(book.get("bids", []), key=lambda x: float(x["price"]), reverse=True)
     asks = sorted(book.get("asks", []), key=lambda x: float(x["price"]))
     return bids, asks
 
 
-def build_orderbooks(book_data: list[tuple[str, dict, float]]) -> Group:
+def build_orderbooks(book_data: list[tuple]) -> Group:
     now = datetime.now().strftime("%H:%M:%S")
     hdr = Text()
     hdr.append(" \u25c6 ", style="bold green")
@@ -375,105 +390,95 @@ def build_orderbooks(book_data: list[tuple[str, dict, float]]) -> Group:
     parts: list[Any] = [hdr, Text("")]
 
     for title, book, ref_price in book_data[:3]:
-        bids, asks = normalize_book(book)
+        try:
+            bids, asks = normalize_book(book)
 
-        bid_total = sum(float(b["size"]) for b in bids)
-        ask_total = sum(float(a["size"]) for a in asks)
-        total = bid_total + ask_total or 1
+            bid_total = sum(float(b["size"]) for b in bids)
+            ask_total = sum(float(a["size"]) for a in asks)
+            total = bid_total + ask_total or 1
 
-        best_bid = float(bids[0]["price"]) if bids else 0
-        best_ask = float(asks[0]["price"]) if asks else 1
+            best_bid = float(bids[0]["price"]) if bids else 0
+            best_ask = float(asks[0]["price"]) if asks else 1
 
-        if best_bid > 0 and best_ask < 1:
-            mid = (best_bid + best_ask) / 2
-            spread = best_ask - best_bid
-        else:
-            mid = ref_price
-            spread = best_ask - best_bid if best_bid > 0 else 0
-
-        spread_bps = int(spread * 10000) if spread > 0 else 0
-        bid_pct = bid_total / total * 100 if total else 50
-
-        bid_dollars = sum(float(b["size"]) * float(b["price"]) for b in bids)
-        ask_dollars = sum(float(a["size"]) * float(a["price"]) for a in asks)
-
-        # ── Market header ──
-        info = Text()
-        info.append(trunc(title, 50), style="bold white")
-        info.append("\n")
-        info.append(f"MID:{fmt_cents(mid)}", style="yellow")
-        info.append(f"  SPRD:{spread * 100:.1f}\u00a2 ({spread_bps}bps)", style="white")
-        info.append(f"  IMBAL:{int(bid_pct)}%", style="cyan")
-        info.append("\n")
-
-        # ── Imbalance bar ──
-        bw = max(1, int(bid_pct * 36 / 100))
-        aw = max(1, 36 - bw)
-        info.append(f"BIDS:${bid_dollars:,.0f} ({len(bids)}lvl) ", style="green")
-        info.append("\u2588" * bw, style="green")
-        info.append("\u2588" * aw, style="red")
-        info.append(f" ASKS:${ask_dollars:,.0f} ({len(asks)}lvl)", style="red")
-        info.append("\n")
-        info.append(f"{'':>{bw + 18}}{int(bid_pct)}%", style="dim")
-
-        # ── Depth table ──
-        dt = Table(
-            box=None, expand=True, show_header=True, show_edge=False,
-            pad_edge=False, padding=(0, 1), header_style="dim white",
-        )
-        dt.add_column("CUM$", justify="right", width=8)
-        dt.add_column("SIZE", justify="right", width=7)
-        dt.add_column("", width=4)        # bid bar
-        dt.add_column("BID", justify="right", width=6, style="green")
-        dt.add_column("ASK", justify="left", width=6, style="red")
-        dt.add_column("", width=4)        # ask bar
-        dt.add_column("SIZE", justify="right", width=7)
-        dt.add_column("CUM$", justify="right", width=8)
-
-        n_rows = 8
-        show_bids = bids[:n_rows]
-        show_asks = asks[:n_rows]
-
-        max_sz = max(
-            [float(b["size"]) for b in show_bids]
-            + [float(a["size"]) for a in show_asks]
-            + [1],
-        )
-        cum_b = cum_a = 0.0
-
-        for i in range(n_rows):
-            br = show_bids[i] if i < len(show_bids) else None
-            ar = show_asks[i] if i < len(show_asks) else None
-
-            if br:
-                bp, bs = float(br["price"]), float(br["size"])
-                cum_b += bs * bp
-                bbar_w = max(0, int(bs / max_sz * 4))
-                b_vals = (
-                    fmt_size(cum_b),
-                    fmt_size(bs),
-                    Text("\u2588" * bbar_w, style="green"),
-                    fmt_cents(bp),
-                )
+            if best_bid > 0 and best_ask < 1:
+                mid = (best_bid + best_ask) / 2
+                spread = best_ask - best_bid
             else:
-                b_vals = ("", "", Text(""), "")
+                mid = ref_price
+                spread = best_ask - best_bid if best_bid > 0 else 0
 
-            if ar:
-                ap, az = float(ar["price"]), float(ar["size"])
-                cum_a += az * ap
-                abar_w = max(0, int(az / max_sz * 4))
-                a_vals = (
-                    fmt_cents(ap),
-                    Text("\u2588" * abar_w, style="red"),
-                    fmt_size(az),
-                    fmt_size(cum_a),
-                )
-            else:
-                a_vals = ("", Text(""), "", "")
+            spread_bps = int(spread * 10000) if spread > 0 else 0
+            bid_pct = bid_total / total * 100 if total else 50
 
-            dt.add_row(*b_vals, *a_vals)
+            bid_dollars = sum(float(b["size"]) * float(b["price"]) for b in bids)
+            ask_dollars = sum(float(a["size"]) * float(a["price"]) for a in asks)
 
-        parts.extend([info, dt, Text("")])
+            info = Text()
+            info.append(trunc(title, 50), style="bold white")
+            info.append("\n")
+            info.append(f"MID:{fmt_cents(mid)}", style="yellow")
+            info.append(f"  SPRD:{spread * 100:.1f}\u00a2 ({spread_bps}bps)", style="white")
+            info.append(f"  IMBAL:{int(bid_pct)}%", style="cyan")
+            info.append("\n")
+
+            bw = max(1, int(bid_pct * 36 / 100))
+            aw = max(1, 36 - bw)
+            info.append(f"BIDS:${bid_dollars:,.0f} ({len(bids)}lvl) ", style="green")
+            info.append("\u2588" * bw, style="green")
+            info.append("\u2588" * aw, style="red")
+            info.append(f" ASKS:${ask_dollars:,.0f} ({len(asks)}lvl)", style="red")
+            info.append("\n")
+            info.append(f"{'':>{bw + 18}}{int(bid_pct)}%", style="dim")
+
+            dt = Table(
+                box=None, expand=True, show_header=True, show_edge=False,
+                pad_edge=False, padding=(0, 1), header_style="dim white",
+            )
+            dt.add_column("CUM$", justify="right", width=8)
+            dt.add_column("SIZE", justify="right", width=7)
+            dt.add_column("", width=4)
+            dt.add_column("BID", justify="right", width=6, style="green")
+            dt.add_column("ASK", justify="left", width=6, style="red")
+            dt.add_column("", width=4)
+            dt.add_column("SIZE", justify="right", width=7)
+            dt.add_column("CUM$", justify="right", width=8)
+
+            n_rows = 8
+            show_bids = bids[:n_rows]
+            show_asks = asks[:n_rows]
+
+            max_sz = max(
+                [float(b["size"]) for b in show_bids]
+                + [float(a["size"]) for a in show_asks]
+                + [1],
+            )
+            cum_b = cum_a = 0.0
+
+            for i in range(n_rows):
+                br = show_bids[i] if i < len(show_bids) else None
+                ar = show_asks[i] if i < len(show_asks) else None
+
+                if br:
+                    bp, bs = float(br["price"]), float(br["size"])
+                    cum_b += bs * bp
+                    bbar_w = max(0, int(bs / max_sz * 4))
+                    b_vals = (fmt_size(cum_b), fmt_size(bs), Text("\u2588" * bbar_w, style="green"), fmt_cents(bp))
+                else:
+                    b_vals = ("", "", Text(""), "")
+
+                if ar:
+                    ap, az = float(ar["price"]), float(ar["size"])
+                    cum_a += az * ap
+                    abar_w = max(0, int(az / max_sz * 4))
+                    a_vals = (fmt_cents(ap), Text("\u2588" * abar_w, style="red"), fmt_size(az), fmt_size(cum_a))
+                else:
+                    a_vals = ("", Text(""), "", "")
+
+                dt.add_row(*b_vals, *a_vals)
+
+            parts.extend([info, dt, Text("")])
+        except Exception:
+            parts.append(Text(f"  Error rendering: {trunc(title, 40)}", style="dim red"))
 
     if not book_data:
         parts.append(Text("  Loading orderbooks\u2026", style="dim"))
@@ -553,8 +558,7 @@ def build_traders(leaders: list[dict], period: str = "day") -> Group:
         vol = float(entry.get("vol", entry.get("volume", 0)))
         pnl_s = "green" if pnl >= 0 else "red"
         t.add_row(
-            str(i),
-            "",
+            str(i), "",
             trunc(str(name), 14),
             Text(fmt_pnl(pnl), style=pnl_s),
             Text(fmt_vol(vol), style="white"),
@@ -586,7 +590,6 @@ def build_events(events: list[dict]) -> Group:
 
 
 def build_feed(feed: deque) -> Text:
-    """Render the trade feed from real trade data."""
     txt = Text()
     for ts, side, price, size, title in list(feed)[:22]:
         sty = "green" if side == "BUY" else "red"
@@ -602,15 +605,15 @@ def build_feed(feed: deque) -> Text:
     return txt
 
 
-def parse_live_trades(raw_trades: list[dict], seen: set) -> list[tuple]:
-    """Parse raw API trades into feed tuples, deduplicating."""
+def parse_live_trades(raw_trades: list[dict], seen: OrderedDict) -> list[tuple]:
+    """Parse raw API trades into feed tuples, deduplicating with full keys."""
     new_trades = []
     for t in raw_trades:
-        # Create a unique key from wallet+timestamp+asset to deduplicate
-        key = f"{t.get('proxyWallet','')[:10]}_{t.get('timestamp','')}_{t.get('asset','')[:10]}"
+        # Full unique key — no truncation to avoid collisions
+        key = f"{t.get('proxyWallet', '')}_{t.get('timestamp', '')}_{t.get('asset', '')}_{t.get('size', '')}"
         if key in seen:
             continue
-        seen.add(key)
+        seen[key] = True
 
         side = t.get("side", "BUY")
         price = float(t.get("price", 0))
@@ -624,6 +627,10 @@ def parse_live_trades(raw_trades: list[dict], seen: set) -> list[tuple]:
             ts_str = datetime.now().strftime("%H:%M:%S")
 
         new_trades.append((ts_str, side, price, size, trunc(title, 24)))
+
+    # Prune seen by insertion order (OrderedDict preserves order)
+    while len(seen) > 500:
+        seen.popitem(last=False)
 
     return new_trades
 
@@ -715,6 +722,9 @@ Screen {
 
 # ── Textual App ────────────────────────────────────────────────────────────
 
+# Max trades waiting to be displayed — prevents unbounded growth
+_MAX_TRADE_QUEUE = 60
+
 
 class PolymarketTerminal(App):
     CSS = TERMINAL_CSS
@@ -737,15 +747,16 @@ class PolymarketTerminal(App):
         self.leaders_data: list[dict] = []
         self.crypto_data: dict = {}
         self.stock_data: dict = {}
-        self.books_data: list[tuple[str, dict, float]] = []
-        self.book_pool: list[dict] = []       # validated candidates with two-sided books
-        self.book_rotation: int = 0           # rotation offset into pool
+        self.books_data: list[tuple] = []
+        self.book_pool: list[dict] = []
+        self.book_rotation: int = 0
         self.trade_feed: deque = deque(maxlen=40)
-        self.trade_queue: deque = deque()     # incoming trades waiting to be displayed
-        self.trade_seen: set = set()
+        self.trade_queue: deque = deque(maxlen=_MAX_TRADE_QUEUE)
+        self.trade_seen: OrderedDict = OrderedDict()
         self.msg_count = 0
         self.lb_period = "day"
         self.ticker_offset = 0
+        self._book_refresh_count = 0
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -781,10 +792,15 @@ class PolymarketTerminal(App):
         self.set_interval(1.8, self._tick_ticker)
         self.set_interval(1.0, self._tick_status)
 
+    async def on_unmount(self) -> None:
+        """Clean up the HTTP client on shutdown."""
+        await self.api.close()
+
     # ── Data fetching ──
 
     @work(exclusive=True, group="main-refresh")
     async def refresh_all_data(self) -> None:
+        # Fetch all primary data concurrently
         events, raw_markets, leaders, crypto, stocks = await asyncio.gather(
             self.api.events(25),
             self.api.markets(80),
@@ -801,41 +817,49 @@ class PolymarketTerminal(App):
         self.msg_count += len(self.markets_data) + 4
 
         # ── Orderbook rotation ──
-        # Rebuild the validated pool every 5 cycles (~60s) or if empty
         candidates = find_orderbook_candidates(raw_markets)
+
+        # Rebuild the validated pool periodically
         if not self.book_pool or self.book_rotation % 12 == 0:
-            pool: list[dict] = []
-            for cand in candidates[:15]:
-                book = await self.api.order_book(cand["token_id"])
-                bids, asks = normalize_book(book)
-                if len(bids) >= 3 and len(asks) >= 3:
-                    pool.append(cand)
-                if len(pool) >= 8:
-                    break
-            self.book_pool = pool
+            # Validate candidates concurrently (not serially)
+            check_cands = candidates[:10]
+            if check_cands:
+                check_books = await asyncio.gather(
+                    *[self.api.order_book(c["token_id"]) for c in check_cands]
+                )
+                pool: list[dict] = []
+                for cand, book in zip(check_cands, check_books):
+                    bids, asks = normalize_book(book)
+                    if len(bids) >= 3 and len(asks) >= 3:
+                        pool.append(cand)
+                    if len(pool) >= 8:
+                        break
+                self.book_pool = pool
 
-        # Pin slot 0 = highest volume candidate, rotate slots 1-2 through rest
+        # Fetch display books concurrently: pin #1, rotate #2-3
         pool = self.book_pool
-        books: list[tuple[str, dict, float]] = []
+        display_cands = []
         if pool:
-            # Always show #1
-            top = pool[0]
-            book = await self.api.order_book(top["token_id"])
-            books.append((top["question"], book, top["yes"]))
-
-            # Rotate through remaining pool for slots 2 and 3
+            display_cands.append(pool[0])  # pinned top
             rest = pool[1:]
             if rest:
                 n = len(rest)
                 for offset in range(2):
                     idx = (self.book_rotation + offset) % n
-                    cand = rest[idx]
-                    book = await self.api.order_book(cand["token_id"])
-                    books.append((cand["question"], book, cand["yes"]))
+                    display_cands.append(rest[idx])
 
-        self.books_data = books
-        # Advance rotation every ~30s (every 2-3 refresh cycles at 12s interval)
-        self._book_refresh_count = getattr(self, "_book_refresh_count", 0) + 1
+        if display_cands:
+            display_books = await asyncio.gather(
+                *[self.api.order_book(c["token_id"]) for c in display_cands]
+            )
+            self.books_data = [
+                (c["question"], book, c["yes"])
+                for c, book in zip(display_cands, display_books)
+            ]
+        else:
+            self.books_data = []
+
+        self._book_refresh_count += 1
         if self._book_refresh_count % 3 == 0:
             self.book_rotation += 1
 
@@ -843,39 +867,36 @@ class PolymarketTerminal(App):
         self._tick_ticker()
 
     def _render_all(self) -> None:
-        self._safe_update("#markets-panel", build_markets_table(self.markets_data))
-        self._safe_update("#books-inner", build_orderbooks(self.books_data))
-        self._safe_update("#assets-panel", build_assets(self.crypto_data, self.stock_data))
-        self._safe_update("#traders-panel", build_traders(self.leaders_data, self.lb_period))
-        self._safe_update("#events-inner", build_events(self.events_data))
+        self._safe_render("#markets-panel", build_markets_table, self.markets_data)
+        self._safe_render("#books-inner", build_orderbooks, self.books_data)
+        self._safe_render("#assets-panel", build_assets, self.crypto_data, self.stock_data)
+        self._safe_render("#traders-panel", build_traders, self.leaders_data, self.lb_period)
+        self._safe_render("#events-inner", build_events, self.events_data)
 
-    def _safe_update(self, selector: str, content: Any) -> None:
+    def _safe_render(self, selector: str, builder, *args) -> None:
+        """Build content and update widget, catching errors in both phases."""
         try:
+            content = builder(*args)
             self.query_one(selector, Static).update(content)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Render error {selector}: {e}")
 
     # ── Tickers ──
 
     @work(exclusive=True, group="feed-poll")
     async def _poll_trades(self) -> None:
-        """Poll API for new trades and queue them for drip display."""
         raw_trades = await self.api.live_trades(20)
         new_trades = parse_live_trades(raw_trades, self.trade_seen)
-        # Add to queue in chronological order (oldest first, so they drip newest-last)
         for trade in reversed(new_trades):
-            self.trade_queue.append(trade)
-        # Keep seen set from growing unbounded
-        if len(self.trade_seen) > 500:
-            self.trade_seen = set(list(self.trade_seen)[-200:])
+            if len(self.trade_queue) < _MAX_TRADE_QUEUE:
+                self.trade_queue.append(trade)
 
     def _drip_trade(self) -> None:
-        """Pop one trade from the queue into the visible feed every tick."""
         if self.trade_queue:
             trade = self.trade_queue.popleft()
             self.trade_feed.appendleft(trade)
             self.msg_count += 1
-            self._safe_update("#feed-panel", build_feed(self.trade_feed))
+            self._safe_render("#feed-panel", build_feed, self.trade_feed)
 
     def _tick_ticker(self) -> None:
         if not self.markets_data:
@@ -915,27 +936,38 @@ class PolymarketTerminal(App):
             remaining -= len(chunk)
             pos = 0
 
-        self._safe_update("#ticker", txt)
+        try:
+            self.query_one("#ticker", Static).update(txt)
+        except Exception:
+            pass
 
     def _tick_status(self) -> None:
         now = datetime.now().strftime("%H:%M:%S")
+        err_count = len(self.api.errors)
         txt = Text(style="on #111128")
-        txt.append(" \u25c6 ", style="bold green")
-        txt.append("POLY", style="bold green")
+        txt.append(" \u25c6 ", style="bold green" if err_count == 0 else "bold yellow")
+        txt.append("POLY", style="bold green" if err_count == 0 else "bold yellow")
         txt.append(f"  {now}  ", style="bold white")
         txt.append(f"MKT:{len(self.markets_data)}", style="cyan")
         txt.append("    EXEC:1", style="dim white")
         txt.append(f"    MSG:{self.msg_count}", style="dim white")
-        txt.append("    16/s", style="dim white")
+        if err_count > 0:
+            txt.append(f"    ERR:{err_count}", style="bold red")
+        else:
+            txt.append("    16/s", style="dim white")
         txt.append("    MKT:", style="dim white")
         txt.append("LIVE", style="bold green")
         txt.append("    RTDS:", style="dim white")
         txt.append("LIVE", style="bold green")
-        self._safe_update("#status", txt)
+        try:
+            self.query_one("#status", Static).update(txt)
+        except Exception:
+            pass
 
     # ── Key bindings ──
 
     def action_force_refresh(self) -> None:
+        self.api.errors.clear()
         self.refresh_all_data()
 
     def action_lb_day(self) -> None:
