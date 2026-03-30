@@ -171,32 +171,28 @@ class PolyAPI:
     _crypto_cache: dict = {}
 
     async def crypto_prices(self) -> dict:
-        for url, parser in [
-            ("https://api.coingecko.com/api/v3/simple/price", self._parse_coingecko),
-            ("https://api.coincap.io/v2/assets", self._parse_coincap),
-        ]:
+        sources = [
+            ("coingecko", "https://api.coingecko.com/api/v3/simple/price", self._parse_coingecko,
+             dict(ids="bitcoin,ethereum,solana,ripple", vs_currencies="usd", include_24hr_change="true")),
+            ("coincap", "https://api.coincap.io/v2/assets", self._parse_coincap,
+             dict(ids="bitcoin,ethereum,solana,xrp")),
+        ]
+        for name, url, parser, params in sources:
             try:
-                params = (
-                    dict(ids="bitcoin,ethereum,solana,ripple", vs_currencies="usd", include_24hr_change="true")
-                    if "coingecko" in url
-                    else dict(ids="bitcoin,ethereum,solana,xrp")
-                )
                 r = await self.http.get(url, params=params)
                 if r.status_code == 200:
                     data = parser(r.json())
                     if data:
                         self._crypto_cache = data
                         return data
-            except Exception:
-                pass
+                else:
+                    self._record_error(name, Exception(f"HTTP {r.status_code}"))
+            except Exception as e:
+                self._record_error(name, e)
         if self._crypto_cache:
             return self._crypto_cache
-        return {
-            "bitcoin": {"usd": 69495, "usd_24h_change": 0.02},
-            "ethereum": {"usd": 2077.21, "usd_24h_change": -0.04},
-            "solana": {"usd": 87.64, "usd_24h_change": 0.05},
-            "xrp": {"usd": 1.37, "usd_24h_change": -0.01},
-        }
+        self._record_error("crypto", Exception("all sources failed, no cache"))
+        return {}
 
     @staticmethod
     def _parse_coingecko(data: dict) -> dict:
@@ -244,6 +240,7 @@ class PolyAPI:
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             if r.status_code != 200:
+                self._record_error(f"yahoo/{symbol}", Exception(f"HTTP {r.status_code}"))
                 return None
             data = r.json()
             meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
@@ -254,7 +251,8 @@ class PolyAPI:
             else:
                 chg_pct = 0
             return {"price": float(price), "change": float(chg_pct)}
-        except Exception:
+        except Exception as e:
+            self._record_error(f"yahoo/{symbol}", e)
             return None
 
 
@@ -821,7 +819,6 @@ class PolymarketTerminal(App):
 
         # Rebuild the validated pool periodically
         if not self.book_pool or self.book_rotation % 12 == 0:
-            # Validate candidates concurrently (not serially)
             check_cands = candidates[:10]
             if check_cands:
                 check_books = await asyncio.gather(
@@ -829,9 +826,12 @@ class PolymarketTerminal(App):
                 )
                 pool: list[dict] = []
                 for cand, book in zip(check_cands, check_books):
-                    bids, asks = normalize_book(book)
-                    if len(bids) >= 3 and len(asks) >= 3:
-                        pool.append(cand)
+                    try:
+                        bids, asks = normalize_book(book)
+                        if len(bids) >= 3 and len(asks) >= 3:
+                            pool.append(cand)
+                    except Exception:
+                        continue  # skip malformed book, don't crash refresh
                     if len(pool) >= 8:
                         break
                 self.book_pool = pool
@@ -888,8 +888,10 @@ class PolymarketTerminal(App):
         raw_trades = await self.api.live_trades(20)
         new_trades = parse_live_trades(raw_trades, self.trade_seen)
         for trade in reversed(new_trades):
-            if len(self.trade_queue) < _MAX_TRADE_QUEUE:
-                self.trade_queue.append(trade)
+            self.trade_queue.append(trade)
+        # If queue overflows, drop oldest (stale) to keep newest trades
+        while len(self.trade_queue) > _MAX_TRADE_QUEUE:
+            self.trade_queue.popleft()
 
     def _drip_trade(self) -> None:
         if self.trade_queue:
